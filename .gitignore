@@ -1,0 +1,9 @@
+build/
+obj_dir/
+syn/out/
+__pycache__/
+*.pyc
+tb/results.xml
+*.vcd
+*.fst
+.venv
