@@ -1,0 +1,13 @@
+# Generic (technology-independent) synthesis of the ITCH parser top.
+# Input is produced by sv2v (make synth runs it): Yosys's native SV frontend does not
+# support package imports in the module header.
+# (run `make synth`; it generates syn/out/itch_top_sv2v.v first)
+read_verilog syn/out/itch_top_sv2v.v
+chparam -set MOLD_HDR 1 itch_top
+synth -top itch_top -flatten
+tee -o syn/out/stat_generic.txt stat
+# Map to generic 6-input LUTs to estimate logic depth (LUT levels, reg->reg and IO)
+abc -lut 6
+opt_clean
+tee -o syn/out/stat_lut6.txt stat
+tee -o syn/out/ltp_lut6.txt ltp -noff

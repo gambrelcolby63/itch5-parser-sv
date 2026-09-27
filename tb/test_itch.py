@@ -171,8 +171,10 @@ class Harness:
         return c1
 
 
-def build_random(rng: random.Random, n_msgs: int, mold: bool, p_unsup=0.2, max_per_frame=20) -> StreamBuilder:
-    sb = StreamBuilder(mold=mold, session=b"%010d" % rng.randrange(10**10), seq=rng.randrange(1, 2**40))
+def build_random(rng: random.Random, n_msgs: int, mold: bool, p_unsup=0.2, max_per_frame=20,
+                 sparse: bool = False) -> StreamBuilder:
+    sb = StreamBuilder(mold=mold, session=b"%010d" % rng.randrange(10**10), seq=rng.randrange(1, 2**40),
+                       sparse_rng=random.Random(rng.getrandbits(32)) if sparse else None)
     left = n_msgs
     while left > 0:
         r = rng.random()
@@ -233,6 +235,17 @@ async def test_random_backpressure(dut):
     for i, (pv, pr) in enumerate([(0.9, 0.9), (0.5, 0.7), (0.8, 0.3), (1.0, 0.95)]):
         sb = build_random(rng, per, bool(MOLD))
         await h.run(sb, rng, p_valid=pv, p_ready=pr, name=f"random[p_valid={pv},p_ready={pr}]")
+
+
+@cocotb.test()
+async def test_partial_beats(dut):
+    """Beats carrying 1..8 valid bytes anywhere in a frame (tkeep contiguous from lane 0,
+    junk in the unused lanes), with gaps and backpressure."""
+    h = Harness(dut)
+    await h.start()
+    rng = random.Random(SEED + 4)
+    sb = build_random(rng, 3000, bool(MOLD), sparse=True)
+    await h.run(sb, rng, p_valid=0.8, p_ready=0.8, name="partial_beats")
 
 
 @cocotb.test()

@@ -151,28 +151,38 @@ class Beat:
     early: list[int] = field(default_factory=list)
 
 
-def pack_frame(frame: bytes, byte_tags: dict[int, tuple[str, int]] | None = None) -> list[Beat]:
-    """Pack one tlast-delimited frame into 8-byte beats. byte_tags maps a byte index in
-    the frame to ("end"|"early", expected_msg_index)."""
+def pack_frame(frame: bytes, byte_tags: dict[int, tuple[str, int]] | None = None,
+               sparse_rng: random.Random | None = None) -> list[Beat]:
+    """Pack one tlast-delimited frame into beats. byte_tags maps a byte index in the frame
+    to ("end"|"early", expected_msg_index). Normally beats are full (8 bytes) except the
+    last; with sparse_rng, beats carry a random 1..8 bytes (tkeep contiguous from lane 0)
+    and the unused upper lanes are filled with junk."""
     beats = []
-    for i in range(0, len(frame), 8):
-        chunk = frame[i:i + 8]
-        b = Beat(data=int.from_bytes(chunk, "little"), keep=(1 << len(chunk)) - 1,
-                 last=int(i + 8 >= len(frame)))
+    i = 0
+    while i < len(frame):
+        n = 8 if sparse_rng is None or sparse_rng.random() < 0.5 else sparse_rng.randint(1, 8)
+        chunk = frame[i:i + n]
+        data = int.from_bytes(chunk, "little")
+        if sparse_rng is not None and len(chunk) < 8:
+            data |= sparse_rng.getrandbits(64) & ~((1 << (8 * len(chunk))) - 1) & (2**64 - 1)
+        b = Beat(data=data, keep=(1 << len(chunk)) - 1, last=int(i + n >= len(frame)))
         if byte_tags:
             for j in range(i, i + len(chunk)):
                 if j in byte_tags:
                     for kind, idx in byte_tags[j]:
                         (b.ends if kind == "end" else b.early).append(idx)
         beats.append(b)
+        i += n
     return beats
 
 
 class StreamBuilder:
     """Accumulates frames and the expected decoder output."""
 
-    def __init__(self, mold: bool, session: bytes = b"ITCHSESS01", seq: int = 1):
+    def __init__(self, mold: bool, session: bytes = b"ITCHSESS01", seq: int = 1,
+                 sparse_rng: random.Random | None = None):
         self.mold = mold
+        self.sparse_rng = sparse_rng
         self.session = session
         self.seq = seq
         self.beats: list[Beat] = []
@@ -227,7 +237,7 @@ class StreamBuilder:
                                             int.from_bytes(m[11:19], "big")))
                 tags.setdefault(pos + 2 + 18, []).append(("early", eidx))
         frame = prefix + bytes(body) + raw_tail
-        self.beats += pack_frame(frame, tags)
+        self.beats += pack_frame(frame, tags, self.sparse_rng)
         self.n_frames += 1
         self.n_bytes += len(frame)
         return frame
