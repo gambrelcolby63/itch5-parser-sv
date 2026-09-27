@@ -1,9 +1,6 @@
 # Xilinx UltraScale+ mapping (LUT6/FDRE/CARRY8), no vendor tools required.
-# Input is produced by sv2v (make synth runs it): Yosys's native SV frontend does not
-# support package imports in the module header.
+# `make synth` reads syn/out/itch_top_sv2v.v and sets MOLD_HDR / PIPE_STAGES with
+# chparam before running this script (once per PIPE_STAGES value).
 # Numbers are Yosys estimates, not Vivado post-route results.
-# (run `make synth`; it generates syn/out/itch_top_sv2v.v first)
-read_verilog syn/out/itch_top_sv2v.v
-chparam -set MOLD_HDR 1 itch_top
 synth_xilinx -top itch_top -family xcup -flatten -noiopad
 tee -o syn/out/stat_xilinx.txt stat

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Summarize Yosys `stat` outputs in syn/out/ as a Markdown table."""
+"""Summarize the Yosys outputs in syn/out/ (written by `make synth`) as Markdown tables."""
 import re
 from pathlib import Path
 
@@ -24,18 +24,27 @@ def xilinx_row(name, path):
 
 
 def main():
+    print("| itch_top MOLD_HDR=1 (Yosys `synth; abc -lut 6`) | LUT6 | FF | LUT levels (ltp) | latency (clk) |")
+    print("|---|---|---|---|---|")
+    for p in (0, 1, 2):
+        st, ltp = OUT / f"stat_lut6_p{p}.txt", OUT / f"ltp_lut6_p{p}.txt"
+        if not (st.exists() and ltp.exists()):
+            continue
+        c = cells(st)
+        ffs = sum(v for k, v in c.items() if k.startswith("$_") and "DFF" in k)
+        depth = re.search(r"length=(\d+)", ltp.read_text()).group(1)
+        print(f"| PIPE_STAGES={p} | {c.get('$lut', 0):,} | {ffs:,} | {depth} | {1 + p} |")
+    print()
     print("| Design (Yosys synth_xilinx -family xcup) | LUT | FF | RAMB36 | RAMB18 | LUTRAM | MUXF7/8/9 | CARRY |")
     print("|---|---|---|---|---|---|---|---|")
-    for name, f in (("itch_top (parser only)", "stat_xilinx.txt"),
-                    ("itch_feed_top (parser + FIFO + book, defaults)", "stat_feed_xilinx.txt")):
-        if (OUT / f).exists():
-            print(xilinx_row(name, OUT / f))
-    ltp = OUT / "ltp_lut6.txt"
-    if ltp.exists():
-        m = re.search(r"length=(\d+)", ltp.read_text())
-        c = cells(OUT / "stat_lut6.txt")
-        print(f"\nGeneric `abc -lut 6` (parser only): {c.get('$lut', 0):,} LUT6, "
-              f"longest path {m.group(1)} LUT levels (see README for what that path is)")
+    for p in (0, 1, 2):
+        f = OUT / f"stat_xilinx_p{p}.txt"
+        if f.exists():
+            print(xilinx_row(f"itch_top (parser only), PIPE_STAGES={p}", f))
+    f = OUT / "stat_feed_xilinx.txt"
+    if f.exists():
+        print(xilinx_row("itch_feed_top (parser + FIFO + book, defaults)", f))
+    print("\nPer-endpoint depth breakdown: syn/out/depth_p<N>.txt (scripts/depth_report.py)")
 
 
 if __name__ == "__main__":
