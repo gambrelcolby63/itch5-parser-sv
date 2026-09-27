@@ -6,10 +6,11 @@ A synthesizable, vendor-neutral SystemVerilog **market-data feed handler** for N
 over MoldUDP64. It has two parts:
 
 * **`itch_parser`** takes a 64-bit AXI4-Stream and decodes one message per clock. The result is
-  registered **1 cycle** after the message's last byte, with no bubbles at line rate.
+  registered **1 + `PIPE_STAGES` cycles** after the message's last byte (1, 2 or 3), with no bubbles
+  at line rate. `PIPE_STAGES` trades latency cycles for clock rate (see [Timing](#timing-critical-path-analysis-and-pipelining)).
 * **`itch_book`** is an order-level → price-level book for a subscribed set of symbols (default 256
-  symbols, 8 levels per side). A full post-update side book comes out **4 cycles** after the last
-  byte of the ITCH message.
+  symbols, 8 levels per side). A full post-update side book comes out **4 + `PIPE_STAGES` cycles**
+  after the last byte of the ITCH message.
 
 Everything is verified with cocotb against independent Python golden models, on Verilator and on Icarus.
 
@@ -19,11 +20,12 @@ Everything is verified with cocotb against independent Python golden models, on 
 |---|---|
 | RTL | SystemVerilog, synthesizable subset, no vendor primitives, `verilator -Wall` clean (0 warnings, no waivers) |
 | Interface | AXI4-Stream in (`tdata[63:0]`, `tkeep`, `tvalid`, `tready`, `tlast`), book events out |
-| Parser latency | **1 clock**, last byte in → decoded message registered (measured for every message) |
-| Book latency | **4 clocks**, last byte in → post-update side book registered (measured for every event) |
-| Throughput | 8 B/clock sustained, **0 input stall cycles** in every full-rate test, including a worst-case message-rate stream |
-| Verification | parser: 42k messages per `make test`; book: every event compared bit-exactly with a model; soak of 849k parser messages + 1.73M parser→book messages over 5 seeds; mutation testing (20 injected bugs, all caught); Verilator + Icarus |
-| Reproducible | `make lint`, `make test`, `make synth`; GitHub Actions workflow for lint + tests |
+| Parser latency | **1 + `PIPE_STAGES` clocks** (1, 2 or 3), last byte in → decoded message registered; checked exactly for every message |
+| Book latency | **4 + `PIPE_STAGES` clocks**, last byte in → post-update side book registered; checked exactly for every event |
+| Throughput | 8 B/clock sustained in every configuration, **0 input stall cycles** in every full-rate test, including a worst-case message-rate stream |
+| Parser timing | longest path **22 → 10 / 7 / 7** generic LUT6 levels (`PIPE_STAGES` 0 / 1 / 2). Post-route estimate on Artix-7 xc7a200t-1 with the open-source nextpnr-xilinx: **~60 MHz → 99–120 / 111–127 / 140–163 MHz** (3 placement seeds, not Vivado) |
+| Verification | per `make test`: ~42.5k parser messages and 3 book suites in each of the 3 pipeline configs; book events compared bit-exactly with a model; soak over 5 seeds × 3 configs; mutation testing (35 injected bugs, all caught); Verilator + Icarus |
+| Reproducible | `make lint`, `make test`, `make synth`, `make pnr`; GitHub Actions runs lint + tests on every push |
 
 ## Architecture
 
@@ -31,15 +33,15 @@ Everything is verified with cocotb against independent Python golden models, on 
 flowchart LR
     MAC["10/25G MAC + UDP<br/>(not in this repo)"] -->|"AXI4-Stream 64b<br/>MoldUDP64 payload"| P
 
-    subgraph P["itch_parser (1 clk)"]
+    subgraph P["itch_parser (1 + PIPE_STAGES clk)"]
         direction TB
-        OFF["block-offset tracker<br/>boff, len, block end"] --> STEER["lane steering<br/>lane i → boff+i"]
+        OFF["S1 frame tracker<br/>rem, block end, next length"] -.->|"reg if PIPE_STAGES ≥ 1"| STEER["S2 shared 8-lane rotator<br/>lane i → boff+i"]
         STEER --> BUF["42-byte block buffer"]
         BUF --> MV["merged view<br/>buffer ∪ current beat"]
         STEER --> MV
-        MV --> DEC["field decode<br/>(type-indexed BE mux)"]
-        MV --> EARLY["early decode<br/>(byte 18 seen)"]
-        MV --> HDR["MoldUDP64 header"]
+        MV -.->|"reg if PIPE_STAGES = 2"| DEC["S3 field decode<br/>(type-indexed BE mux)"]
+        MV -.-> EARLY["S3 early decode<br/>(byte 18 seen)"]
+        MV -.-> HDR["S3 MoldUDP64 header"]
     end
 
     DEC -->|"itch_msg_t<br/>valid/ready"| FIFO["stream_fifo<br/>depth 2, fall-through"]
@@ -61,24 +63,30 @@ flowchart LR
 
 ### Parser: how messages that straddle beats are handled
 
-`boff_q` holds the position of lane 0 of the incoming beat inside the current MoldUDP64 message block
-(the 2 length bytes are offsets 0 and 1). Each valid lane is steered to buffer position `boff_q + lane`.
-Every ITCH 5.0 message is at least 12 bytes, so a block is at least 14 bytes, and **a beat contains at
-most one block boundary**: the tail of one block and the head of the next.
+The parser has three logical stages. `PIPE_STAGES` puts a register after S1 (1) or after S1 and S2 (2).
 
-* The tail is merged combinationally with the buffer. The complete message is decoded and registered
-  on the **same edge** that accepts its last byte.
-* The head of the next block goes to buffer positions 0..7 in the same cycle. It can't collide with
-  the tail positions, because of the minimum length.
-* A length prefix split across beats is reassembled from `buf_q[0]` and lane 0.
-* The **MoldUDP64 header** is treated as a fixed 20-byte "block" in the same tracker, so there's no
-  realignment shifter (see the tradeoffs section).
+* **S1, frame tracker.** This is the only per-beat feedback loop. `rem_q` holds how many bytes of the
+  current block (or MoldUDP64 header) are still to come, so "the block ends in this beat, at lane
+  `rem_q`" is a lookup of `tkeep` at a registered index. When the next block's 2-byte length arrives, S1
+  computes the next `rem_q`, the block offset `boff` and a one-hot "length matches type *i*" vector.
+  A length prefix split across beats is kept in `len_hi_q`.
+* **S2, assemble.** Every ITCH 5.0 message is at least 12 bytes, so a block is at least 14 bytes, and
+  **a beat contains at most one block boundary**: the tail of one block and the head of the next. One
+  shared 8-lane rotator steers lane *i* to block offset `boff + i`. The tail merges with the 42-byte
+  block buffer into the *merged view*. The head of the next block goes to buffer positions 0..7 in the
+  same cycle; it can't collide with the tail positions, because of the minimum length.
+* **S3, decode.** Type decode, length check, field extraction from fixed offsets of the merged view,
+  the MoldUDP64 header, the early strobe, packet checks, and the registered outputs.
+
+With `PIPE_STAGES=0` the complete message is decoded and registered on the **same edge** that accepts
+its last byte. The **MoldUDP64 header** is treated as a fixed 20-byte "block" in the same tracker, so
+there's no realignment shifter (see the tradeoffs section).
 
 ### Book: pipeline
 
 | Cycle | Stage | Work |
 |---|---|---|
-| t | parser | beat with the message's last byte accepted; message decoded, registered |
+| t | parser | beat with the message's last byte accepted; message decoded, registered (with `PIPE_STAGES` = *n*, the later rows shift by *n* cycles) |
 | t+1 | accept | message passes the (empty) fall-through FIFO; subscription and order-table reads issued (port A: existing ref, port B: new ref's bucket) |
 | t+2 | LOOK | subscribed? order hit? bucket free? compute order-table writes (update/delete/insert) and level ops; level-table read issued |
 | t+3 | UPD | parallel level update (step 1: remove qty, step 2: add qty; a Replace does both in one pass on the same word); write back; register event |
@@ -93,20 +101,141 @@ most one block boundary**: the tail of one block and the head of the next.
 
 ## Latency and throughput
 
-All latencies are measured by the testbench for every message or event, not estimated. One cycle =
-one clock period. The ns columns only convert units: **no Fmax is claimed** (see Synthesis).
+The testbench measures every latency for every message or event, and it asserts the exact value
+for the configuration under test. One cycle = one clock period. The @ 156.25 MHz column is only a unit
+conversion at the 10GbE 64-bit clock. The Fmax each configuration actually reaches (as an estimate) is
+in [Timing](#timing-critical-path-analysis-and-pipelining).
 
-| Path | Cycles | @ 156.25 MHz (10GbE 64b) | @ 250 MHz | Measured histogram |
-|---|---|---|---|---|
-| Last byte in → `m_valid` (parser) | 1 | 6.4 ns | 4.0 ns | `{1: 42115}` in `make test` |
-| Byte 18 in → `e_valid` (type, locate, order ref) | 1 | 6.4 ns | 4.0 ns | `{1: all}` |
-| Last byte in → `bk_valid` (full side book) | 4 | 25.6 ns | 16.0 ns | `{4: all}` in every book test |
+| Path | `PIPE_STAGES` = 0 / 1 / 2 | @ 156.25 MHz (10GbE 64b) | Measured in `make test` |
+|---|---|---|---|
+| Last byte in → `m_valid` (parser) | 1 / 2 / 3 cycles | 6.4 / 12.8 / 19.2 ns | exactly `1 + PIPE_STAGES` for all ~42.5k messages per configuration |
+| Byte 18 in → `e_valid` (type, locate, order ref) | 1 / 2 / 3 cycles | 6.4 / 12.8 / 19.2 ns | exactly `1 + PIPE_STAGES` for every early strobe |
+| Last byte in → `bk_valid` (full side book) | 4 / 5 / 6 cycles | 25.6 / 32.0 / 38.4 ns | exactly `4 + PIPE_STAGES` for every book event |
+
+Under `m_ready` backpressure the whole parser holds, so the testbench counts *advancing* clock edges
+between the input and the output. That count is exactly `1 + PIPE_STAGES` in every test, and the raw
+cycle count equals it whenever no stall happens in between.
 
 | Throughput | Capability | Evidence |
 |---|---|---|
-| Parser input | 8 B/clock, back to back (10 Gb/s at 156.25 MHz) | `line_rate`: 8,928 beats in 8,937 cycles, 0 stalls |
+| Parser input | 8 B/clock, back to back (10 Gb/s at 156.25 MHz), every `PIPE_STAGES` | `line_rate`: 8,928 beats, 0 stalls, in each configuration |
 | Book | 1 book message per 2 clocks, 1 non-book message per clock | shortest book message block is `D` = 21 B = 2.6 beats > 2 clocks, so the book is never the bottleneck at line rate |
 | Parser → book | a 2-entry fall-through FIFO absorbs the 1-message backlog when a 14-byte block lands while the book is busy | `book_adversarial_rate` (35% `S`, back-to-back `D`, unsubscribed, misses): 47,387 beats, **0 stalls**, peak FIFO occupancy 1 |
+
+## Timing: critical path analysis and pipelining
+
+### Before and after
+
+Parser only (`itch_top`, `MOLD_HDR=1`). "Before" is commit `5d9cb2c`, the single-cycle parser as first written.
+
+| Configuration | Latency (clk) | Generic LUT6 levels | Generic LUT6 | FF | UltraScale+ LUT / FF (Yosys) | Post-route Fmax, xc7a200t-1 (nextpnr-xilinx, 3 seeds) | Latency at median Fmax |
+|---|---|---|---|---|---|---|---|
+| before | 1 | **22** | 2,622 | 1,326 | 5,143 / 1,326 | 59.0 / 60.1 / 60.7 MHz | 16.6 ns |
+| `PIPE_STAGES=0` | 1 | **10** | 1,596 | 1,291 | 2,600 / 1,291 | 99.4 / 101.7 / 119.6 MHz | 9.8 ns |
+| `PIPE_STAGES=1` | 2 | **7** | 1,612 | 1,395 | 2,084 / 1,395 | 111.3 / 118.0 / 127.4 MHz | 16.9 ns |
+| `PIPE_STAGES=2` | 3 | **7** | 1,600 | 1,747 | 2,192 / 1,747 | 139.9 / 159.5 / 162.7 MHz | 18.8 ns |
+
+* **Generic LUT6 levels**: Yosys 0.52 `synth -flatten; abc -lut 6`, then `ltp`, covering every
+  register/IO → register/IO path (`make synth`; per-endpoint breakdown via `scripts/depth_report.py`).
+  This is a technology-independent proxy: it has no carry chains, and ABC's depth mapping is
+  heuristic. The same kind of change moved results by ±1 level between runs.
+* **Post-route Fmax** is a real place-and-route, but it is an **open-source estimate, not Vivado
+  sign-off**. The flow is Yosys `synth_xilinx -family xc7 -abc9` then nextpnr-xilinx (openXC7,
+  prjxray timing database) on an **Artix-7 xc7a200tfbg484-1**, with 3 placement seeds per
+  configuration (`make pnr`). The parser sits in `syn/timing_harness.sv`, which feeds its inputs from
+  a shift register and XOR-folds all ~940 output bits into one registered pin. That way, every parser
+  path is register-to-register and the design fits the package's pins. The harness adds ~75 input
+  FFs and a registered 6:1 XOR tree.
+* **The seed spread is large** (P0 99→120 MHz): at these depths, routing is 54–77% of the critical-path delay.
+  Speed grade is not modelled separately: prjxray has one timing set for the family.
+* No UltraScale+ timing is claimed: no open place-and-route flow with timing data for it was
+  available here. On UltraScale+
+  the absolute numbers would be higher. The ranking should hold, but that is not measured.
+
+### What limited the single-cycle parser
+
+Probing internal nets of the original design on the generic LUT6 map (arrival depth in LUT levels):
+
+| Signal | Depth | Why |
+|---|---|---|
+| byte count `nb` (priority-encode `tkeep`) | 2 | |
+| current length (mux of buffer byte / lane bytes by `boff`) | 4 | length is re-selected from the byte lanes every beat |
+| block total `len + 2` | 8 | 16-bit add after the mux |
+| bytes remaining `total − boff` | 10 | 17-bit subtract after the add |
+| `cur_ends` (`remaining ≤ nb`) | 11 | compare after the subtract |
+| `boff_q` next state | 13 | **the per-beat recurrence**: everything above is inside it |
+| lane steering, message type | 14 | steering waits for `cur_ends` |
+| `emit` (type decode → spec-length mux → 16-bit compare) | 17 | |
+| 32-bit statistics counters | **22** | counter add chained after `emit`, ripple-carried in a generic map |
+
+The root cause was structural. Every beat rebuilt "bytes remaining" from a length muxed out of the
+buffer or lanes (add, then subtract, then compare). Lane steering, type decode, the length check,
+`emit` and the counters were all chained behind that. On the real part, the baseline critical path
+started at `boff_q` and spent 7.1–7.6 ns in logic plus 9.1–9.5 ns in routing.
+
+### What was restructured
+
+1. **Carry the remaining-byte count as state (`rem_q`).** The block end is known from a register, not
+   recomputed from the length every beat. Length arithmetic happens only when a new length arrives,
+   and it only feeds next-state registers.
+2. **Read `tkeep` as a thermometer code.** `tkeep` is contiguous by contract, so "at least *n* bytes"
+   is `tkeep[n-1]`. Block-ends-here, next-block-present, and whether the next length is complete are
+   each one `tkeep` bit selected by a registered index, instead of encode → subtract → compare. The
+   binary byte count only feeds the tracker's own arithmetic.
+3. **Split subtraction** (`sub_small`). `x − nb` computes the low nibble and uses its borrow to pick
+   between `x_hi` and `x_hi − 1`. Both of those depend only on registers or tdata, so the wide part
+   runs in parallel with the `tkeep` decode.
+4. **Precomputed comparisons.** "Length < 7" is evaluated for all 8 lane positions straight from
+   tdata, and the tracker only selects one flag. The spec-length check is a one-hot "length == spec
+   length of type *i*" vector computed in S1 as soon as the length is known, so S3 does
+   `|(type_onehot & len_hit)` instead of type decode → length mux → 16-bit compare.
+5. **One shared 8-lane rotator** in S2 replaces the per-buffer-byte 8:1 lane muxes. Together with
+   item 1, this is where total generic LUTs fell from 2,622 to ~1,600.
+6. **Message-count check as a down-counter** (`blk_left_q`, loaded from the header, compared with
+   0/1), replacing increment → mux → 16-bit compare at `tlast`.
+7. **Statistics counters off the path.** Event pulses are registered, and each counter is a
+   `stat_counter`: 8-bit segments with registered "segment is all ones" flags. The count is exact
+   every cycle, and the carry into a segment is an AND of at most 3 flags plus the increment (3
+   generic levels for 32 bits, against 7 for a ripple adder). Counters update one cycle after the output they count.
+8. **Output registers without the decision in their enable.** `m_msg` loads whenever the output
+   register is free; it is don't-care while `m_valid` is low. `e_*` and `hdr` load every cycle and are
+   qualified by their valid. The deep `emit` decision then drives only `m_valid`, not ~460 clock
+   enables (this was a routed high-fanout path in an intermediate version).
+9. **Optional pipeline registers** (`PIPE_STAGES`) between S1/S2 and S2/S3, all on the same advance
+   enable, so throughput stays one beat per clock and backpressure stays lossless.
+
+What limits each configuration now (generic map, `syn/out/depth_p*.txt`; post-route critical paths
+from nextpnr):
+
+* `PIPE_STAGES=0`: the full `tkeep` → tracker → rotator → decode → `m_valid`/output cone (10 levels).
+  Post-route it starts at `rem_q`.
+* `PIPE_STAGES=1`: S2 + S3 (rotator → decode → outputs, 7 levels) and the S1 recurrence, about equal.
+* `PIPE_STAGES=2`: S1 is the limiter: `tkeep` → next `rem_q`/`boff`/`drop` (7 levels). Post-route,
+  2 of 3 seeds end at `rem_d` from the input register. The third ends in a statistics-counter carry
+  (`evt_q` → `seg_en`) at 6.1 ns.
+
+### The tradeoff
+
+* **Lowest latency in ns: `PIPE_STAGES=0`.** One cycle at ~100–120 MHz is ~8–10 ns, better than the
+  original design in both cycles *and* clock rate. It does not reach 156.25 MHz on this part in these
+  runs.
+* **Highest clock: `PIPE_STAGES=2`.** It reached 159.5 and 162.7 MHz in 2 of 3 seeds, and 139.9 MHz
+  in the third. Its latency is ~19 ns at those clocks. It is the only configuration that can run at
+  the 156.25 MHz clock of a 64-bit 10GbE MAC on an Artix-7 -1 (on these estimates, not signed off).
+* **`PIPE_STAGES=1`** splits the difference and shows the balance: its two stages are about equally
+  deep.
+* In a real system the MAC fixes the clock. At that fixed clock, fewer stages mean fewer ns if timing
+  closes. So the recipe is: use the smallest `PIPE_STAGES` that closes at the MAC clock on the target
+  part. On a faster family (UltraScale+), that is likely a lower setting than on Artix-7, but that is
+  not measured here.
+* **Default: `PIPE_STAGES=0`** (on `itch_top`; `PARSER_PIPE` on `itch_feed_top`). It keeps the
+  original 1-cycle interface timing. On an Artix-7 -1 at the 10GbE clock, use 2.
+* Area barely moves: `PIPE_STAGES=2` costs ~450 extra FFs (the 42-byte merged view is registered)
+  and no extra LUTs.
+* The next steps for timing, in order:
+  * a skid buffer at the output, to cut the `m_ready` → `tready` path and the advance-enable fanout;
+  * an input register with the `tkeep` decode precomputed, which would take S1 below 7 levels;
+  * a Vivado run on the actual target part.
 
 ## Book defaults and why
 
@@ -122,7 +251,9 @@ one clock period. The ns columns only convert units: **no Fmax is claimed** (see
 
 | Decision | Alternative | Why this way |
 |---|---|---|
-| **Merged-view decode**: decode on the edge that accepts the last byte | Realign each message to lane 0, then decode from fixed offsets | Saves a pipeline stage and gives 1-cycle latency. The cost is a wider mux (each buffer byte picks from 8 lanes or the stored byte) and a deeper cone from `boff_q`. Latency first, timing second is the right order for a first slice; the timing plan is below. |
+| **Merged-view decode**: decode on the edge that accepts the last byte | Realign each message to lane 0, then decode from fixed offsets | Saves a pipeline stage and gives 1-cycle latency at `PIPE_STAGES=0`. The cost is a wider mux (each buffer byte picks from 8 lanes or the stored byte). |
+| **`PIPE_STAGES` parameter** (0/1/2) instead of one fixed pipeline | Pick one depth | The right point depends on the clock the MAC imposes and on the part. Keeping all three, with the same tests, makes the latency/Fmax tradeoff measurable instead of argued. |
+| **Stall-all pipeline** (one advance enable, `tready = !m_valid \|\| m_ready`) | Per-stage valid/ready with skid buffers | Simple and provably lossless, and at `m_ready = 1` (the book always accepts) it never stalls. Cost: `m_ready` → `tready` is combinational, and the enable fans out to every pipeline register. A skid buffer at the output would cut both. |
 | **MoldUDP64 header as a 20-byte pseudo-block** | Header stripper with a byte shifter + residual register | A shifter holds bytes in lanes 4–7 until the *next* beat arrives, which is an unbounded wait if the link idles. Here the first block just starts at lane 4, at no cost. |
 | **Registered outputs** | Combinational (0-cycle) output | Registered outputs give clean timing boundaries between blocks. The early strobe claws back latency where it matters (order-ref lookups). |
 | **Speculative early strobe** | Only announce complete messages | For an Add Order, the order ref is known 2–3 beats before the message completes. A downstream table can start its lookup early. It must commit only on `m_valid` (truncation is possible, and the testbench models it). |
@@ -148,15 +279,17 @@ The golden models are written independently of the RTL, straight from the spec t
 
 Each test runs a single cycle-accurate coroutine. It drives random `tvalid` gaps with junk on the idle
 bus and random `m_ready` backpressure, and it checks every output field, every counter, and the latency
-of every message.
+of every message. `make test` runs every parser and book suite in all three `PIPE_STAGES`
+configurations.
 
 | Suite | Test | Covers |
 |---|---|---|
 | parser | `directed_straddle` | each of the 8 types starting at **every lane 0–7** (length prefix and every field straddling beats in every way), plus all 15 undecoded ITCH types |
 | parser | `line_rate` | no gaps; asserts 1 beat/clock |
 | parser | `random_backpressure` | 20k messages over 4 `(p_valid, p_ready)` corners |
-| parser | `partial_beats` | beats carrying 1–8 bytes anywhere in a frame |
-| parser | `errors_and_recovery` | wrong length, short length, truncation, Mold count mismatch, end-of-session, resync |
+| parser | `partial_beats` | beats carrying 1–8 bytes anywhere in a frame, and empty (`tkeep = 0`) `tlast` beats |
+| parser | `errors_and_recovery` | wrong length, short length, truncation, Mold count mismatch, end-of-session and heartbeat (with and without an empty `tlast` beat, and with blocks after them), resync |
+| unit | `stat_counter` | the segmented statistics counter at small widths (W/SEG = 10/2, 9/3, 8/4) through 11–48 wrap-arounds with a mid-run reset, compared every cycle |
 | book | `book_directed` | hand-computed scenarios: level ordering, joins, partial/full execution, `C` uses the resting price, replace into the same bucket, replace/insert collisions, unsubscribed and out-of-range locates, depth overflow and drain with `trunc` |
 | book | `book_random` | 30k-message self-consistent flow over 48 symbols (32 subscribed) with gaps; every event compared bit-exactly against `BookModel`, plus agreement against `IdealBook` |
 | book | `book_line_rate` | full rate, asserts 0 stalls |
@@ -165,19 +298,26 @@ of every message.
 **Results** (`make test`, seed 20260927, Verilator 5.052):
 
 ```
-parser MOLD_HDR=1   TESTS=6 PASS=6 FAIL=0   21,125 messages   latency {1: 21125}
-parser MOLD_HDR=0   TESTS=6 PASS=6 FAIL=0   20,990 messages   latency {1: 20990}
-parser+book         TESTS=5 PASS=5 FAIL=0   book_random: 28,494 msgs -> 18,207 book events, latency {4: 18207}
-                                            book_adversarial_rate: 47,387 beats, input_stalls=0
+PIPE_STAGES      0                    1                    2
+parser Mold      6/6  21,525 msgs     6/6  21,546 msgs     6/6  21,551 msgs     latency exactly 1 / 2 / 3
+parser raw       6/6  20,990 msgs     6/6  20,994 msgs     6/6  20,991 msgs     latency exactly 1 / 2 / 3
+parser+book      5/5                  5/5                  5/5                  latency exactly 4 / 5 / 6
+                 book_random: 28,494 msgs -> 18,207 book events (bit-exact) in each configuration
+                 book_line_rate / book_adversarial_rate (47,387 beats): 0 input stalls in each configuration
+stat_counter     W=10/SEG=2: 11 wraps, W=9/SEG=3: 23 wraps, W=8/SEG=4: 48 wraps, exact every cycle
 ```
 
-**Soak** (`make soak`, seeds 1–5, about 10 minutes):
+(The message counts differ slightly between configurations because the random `tvalid`/`m_ready`
+draws interleave differently with the pipeline.)
+
+**Soak** (`make soak`, seeds 1–5, in each of `PIPE_STAGES` 0 / 1 / 2):
 
 ```
-parser  10 runs (5 seeds x Mold/raw)   30/30 tests pass   848,951 messages      latency always 1
-book     5 runs (5 seeds, 200k each)    25/25 tests pass   1,731,264 messages through parser->book
-         book_random: 949,734 msgs -> 604,944 events, all bit-exact vs BookModel,
-         latency {4: all}, 0 input stalls, peak FIFO occupancy 1
+parser  per configuration: 10 runs (5 seeds x Mold/raw), 60/60 tests pass, ~851k messages
+        (850,951 / 850,965 / 850,861), latency always exactly 1 / 2 / 3; 2.55M messages in total
+book    per configuration: 5 runs (5 seeds, 200k each), 25/25 tests pass, 1,731,264 messages
+        through parser->book; book_random: 949,734 msgs -> 604,944 events, all bit-exact vs
+        BookModel, latency exactly 4 / 5 / 6, 0 input stalls, peak FIFO occupancy 1
 ```
 
 **How close is the bounded hardware book to the true book?** This is measured on the `book_random`
@@ -196,85 +336,119 @@ In every configuration the RTL matched `BookModel` bit-exactly. The agreement co
 *design's* limits, not bugs. It shows that order-table collisions are the dominant error source, while
 depth truncation almost never reaches top-of-book.
 
-**Mutation testing** (`make mutation`) injects 20 realistic bugs, 10 in the parser and 10 in the
-book/FIFO. Examples: wrong field offsets, off-by-one lane steering, a split-length bug, ignored
-`tkeep`/`ready`, asks sorted like bids, a fully executed order not deleted, the same-bucket replace
-treated as a collision, a stale last level, a missing `trunc`, `C` using the execution price, a
-locate that aliases into the table, and a FIFO bypass that ignores ready. **All 20 are caught.**
+**Mutation testing** (`make mutation`) injects 35 realistic bugs:
+* 22 in the parser. Each runs in `PIPE_STAGES` 0 and 2, and counts as caught only if both fail.
+  Pipeline-register mutants run in the configurations where that register exists.
+* 3 in the statistics counter.
+* 10 in the book/FIFO.
+
+Examples: wrong field offsets, a swapped bit in the one-hot length check, a thermometer index off by
+one, a dropped borrow in the split subtraction, the next-block head rotated one lane off, the block
+buffer written on idle cycles, a pipeline register or `m_msg` that loads while stalled, events not
+gated by the advance enable, the message-count check off by one, a counter segment flag set one count
+late, asks sorted like bids, a fully executed order not deleted, `C` using the execution price, and a
+FIFO bypass that ignores ready. **All 35 are caught.** One mutant ("S3 events not gated by the
+advance enable") is equivalent at `PIPE_STAGES=0`, where the stage-3 valid already includes the
+enable, so it runs in 1 and 2. Another (the end-of-session flag not cleared) survived at first. It
+exposed a real gap: nothing tested an empty (`tkeep = 0`) `tlast` beat. Empty `tlast` beats are now
+generated in `partial_beats` and in directed count-check cases.
 
 The same regressions pass on **Icarus Verilog 12** (`make test-icarus`, at reduced size for speed):
-parser 6/6 with 6,614 messages, and book 5/5 with the same latency (`{1: all}` and `{4: all}`). That
-gives a two-simulator cross-check.
+* parser 6/6 in every `PIPE_STAGES` (about 7k messages each, plus raw mode at `PIPE_STAGES=2`);
+* book 5/5 with exact latency 4 / 5 / 6;
+* the counter unit test.
+
+That gives a two-simulator cross-check. It also caught simulator-portability problems that Verilator
+accepted: Icarus rejects variable selects of packed-struct members, and it produced X for one
+lane-pair comparison. The RTL now avoids both constructs.
 
 ## Static analysis
 
-`make lint` runs `verilator --lint-only -Wall` on four configurations: the parser with and without the
-Mold header, the feed top at defaults, and the feed top with `LEVELS=4 NUM_SYMBOLS=64 ORD_BITS=12
-MSG_FIFO_DEPTH=4`. The result is **0 warnings**, and there are no `lint_off` pragmas in the RTL.
+`make lint` runs `verilator --lint-only -Wall` on 16 configurations:
+* the parser top in every `PIPE_STAGES` × `MOLD_HDR` combination;
+* the feed top with `PARSER_PIPE` 0/1/2, plus a small feed config (`LEVELS=4 NUM_SYMBOLS=64
+  ORD_BITS=12 MSG_FIFO_DEPTH=4`);
+* `stat_counter` at four widths;
+* the timing harness.
+
+The result is **0 warnings**, and there are no `lint_off` pragmas in the RTL.
 
 ## Synthesis (Yosys estimates, not vendor place-and-route)
 
 `make synth` converts the RTL with sv2v (Yosys's own SV frontend doesn't accept package imports in
-the module header) and maps it with Yosys 0.52 `synth_xilinx -family xcup` (UltraScale+), without
-IO buffers.
+the module header). It maps the parser in each `PIPE_STAGES` both to generic LUT6 (depth, see
+[Timing](#timing-critical-path-analysis-and-pipelining)) and with Yosys 0.52
+`synth_xilinx -family xcup` (UltraScale+), without IO buffers.
 
 | Design (Yosys 0.52 `synth_xilinx -family xcup`) | LUT | FF | RAMB36 | RAMB18 | LUTRAM | MUXF7/8/9 | CARRY |
 |---|---|---|---|---|---|---|---|
-| `itch_top` (parser only) | 5,143 | 1,326 | 0 | 0 | 0 | 1073/393/104 | 101 |
-| `itch_feed_top` (parser + FIFO + book, defaults) | 10,328 | 2,109 | 260 | 15 | 23 | 2150/787/226 | 243 |
+| `itch_top` (parser only), `PIPE_STAGES=0` | 2,600 | 1,291 | 0 | 0 | 0 | 495/229/69 | 56 |
+| `itch_top` (parser only), `PIPE_STAGES=1` | 2,084 | 1,395 | 0 | 0 | 0 | 154/69/11 | 56 |
+| `itch_top` (parser only), `PIPE_STAGES=2` | 2,192 | 1,747 | 0 | 0 | 0 | 414/114/1 | 56 |
+| `itch_feed_top` (parser + FIFO + book, defaults) | 8,253 | 2,130 | 260 | 15 | 23 | 1637/565/205 | 212 |
 
-Generic `abc -lut 6` map of the parser alone: 2,622 LUT6, longest path 22 LUT levels.
+Before the timing work, the parser was 5,143 LUT / 1,326 FF and the feed top 10,328 LUT / 2,109 FF.
 
 **Where the book's logic goes** (feed top, other parameters at their defaults; book + FIFO = feed − parser):
 
 | Variant | Feed LUT | Book + FIFO LUT | FF | RAMB36 / RAMB18 |
 |---|---|---|---|---|
-| `LEVELS=4` | 7,856 | ~2.7k | 1,852 | 264 / 0 |
-| `LEVELS=8` (default) | 10,328 | ~5.2k | 2,109 | 260 / 15 |
-| `LEVELS=16` | 15,121 | ~10.0k | 2,622 | 260 / 29 |
-| `ORD_BITS=12` (4K orders) | 10,156 | ~5.0k | 2,095 | 20 / 15 |
+| `LEVELS=4` | 5,861 | ~3.3k | 1,873 | 264 / 0 |
+| `LEVELS=8` (default) | 8,253 | ~5.7k | 2,130 | 260 / 15 |
+| `LEVELS=16` | 13,532 | ~10.9k | 2,643 | 260 / 29 |
+| `ORD_BITS=12` (4K orders) | 7,016 | ~4.4k | 2,116 | 20 / 15 |
 
-* Book logic grows **linearly with depth, about 600 LUTs per level**. That is the parallel
+(Book + FIFO is approximate: with `-flatten`, logic optimizes across the parser boundary. The
+`ORD_BITS=12` LUT delta was ~170 with the previous parser and ~1.2k now, so treat LUT differences
+of that size as synthesis noise.)
+
+* Book logic grows **linearly with depth, about 640 LUTs per level**. That is the parallel
   compare/insert/shift network, which is what `LEVELS` really costs.
-* Shrinking the order table 16× saves 240 RAMB36 but almost no LUTs, so the order-table datapath
-  is not the logic cost. Its 64K × 138b (about 9 Mb) belongs in URAM on UltraScale+.
+* Shrinking the order table 16× saves 240 RAMB36. Its 64K × 138b (about 9 Mb) belongs in URAM on
+  UltraScale+.
 * An RTL-style lesson: the first version indexed packed-struct members with loop variables
   (`book.lv[i].price`). That was 16,352 LUTs for the same function, and Icarus couldn't compile it.
   Rewriting the level network on plain unpacked `px[]`/`qty[]` arrays gave bit-identical
-  simulation results (every regression, and all 20 mutants re-killed) at 37% fewer LUTs.
+  simulation results (every regression, and every mutant re-killed) at 37% fewer LUTs.
 
-**Timing (honest).** No Fmax is claimed; nothing has been through Vivado or timing closure yet.
+**Timing (honest).**
 
-* The parser's `boff_q → rem → block-end → lane-steer → decode` cone is deep. On a generic LUT6 map
-  Yosys reports a 22-level longest path, which ends in 8 levels of ripple carry from a 32-bit stats
-  counter because generic mapping has no carry chain.
-* In the book, the cones are the order-table read → level-table address path (block RAM
-  clock-to-out feeding an address), and the 8-level compare/insert network on a 517-bit word.
-* Timing closure on a real part is the first next step.
+* The parser numbers are in [Timing](#timing-critical-path-analysis-and-pipelining). They are generic
+  depth plus open-source place-and-route estimates on Artix-7, not Vivado.
+* The book has not been through place-and-route. Its cones are the order-table read → level-table
+  address path (block RAM clock-to-out feeding an address), and the 8-level compare/insert network on
+  a 517-bit word.
 * Verification is at RTL level. The Yosys netlist has not been simulated or equivalence-checked.
 
 ## Reproduce
 
 ```bash
 ./scripts/setup.sh    # apt deps, Verilator 5.052 from source (cocotb 2.x needs >= 5.036), sv2v, .venv
-make lint             # Verilator -Wall, 4 configurations
-make test             # parser (Mold + raw) and parser+book regressions, ~30 s
+make lint             # Verilator -Wall, 16 configurations
+make test             # parser (Mold + raw), parser+book, in PIPE_STAGES 0/1/2; stat_counter
 make test-icarus      # same on Icarus Verilog (reduced size)
-make synth            # Yosys reports -> syn/out/, summary table printed
-make soak             # 5 seeds: parser 100k x 2 modes + book 200k
-make mutation         # 20 injected bugs must all be caught
-python tb/run.py --top feed --levels 16 --ord-bits 16 --book-msgs 50000   # any configuration
+make synth            # Yosys: generic LUT6 depth per PIPE_STAGES, UltraScale+ maps -> syn/out/summary.md
+make soak             # 5 seeds x PIPE_STAGES 0/1/2: parser 100k x 2 modes + book 200k
+make mutation         # 35 injected bugs must all be caught (runs in parallel, ~3 min on 8 cores)
+python tb/run.py --top parser --pipe 2 --mold 0 --msgs 50000              # any configuration
+python tb/run.py --top feed --pipe 1 --levels 16 --ord-bits 16 --book-msgs 50000
+
+# optional: open-source place-and-route timing estimate on Artix-7 (not in CI)
+./scripts/setup_openxc7.sh   # prebuilt openXC7 (nextpnr-xilinx) + xc7a200t chipdb, pinned SHA-256
+make pnr                     # PIPE_STAGES 0/1/2 x seeds 1-3 -> syn/out/pnr_p*/
+# the "before" row: git worktree add /tmp/base 5d9cb2c && scripts/pnr_xc7.sh --baseline /tmp/base/rtl
 ```
 
 CI (`.github/workflows/ci.yml`) runs on push or PR on `ubuntu-24.04`. It builds Verilator 5.052 from
 source once and caches it, installs a pinned cocotb (`requirements.txt`), then runs `make lint`,
-`make test` and `make test-icarus`, and uploads the logs.
+`make test` and `make test-icarus` (all `PIPE_STAGES` configurations), and uploads the logs.
 
 ## Repository layout
 
 ```
-rtl/itch_pkg.sv          ITCH constants, spec lengths, itch_msg_t, mold_hdr_t
-rtl/itch_parser.sv       MoldUDP64 + ITCH 5.0 parser
+rtl/itch_pkg.sv          ITCH constants, spec lengths, one-hot type/length helpers, itch_msg_t, mold_hdr_t
+rtl/itch_parser.sv       MoldUDP64 + ITCH 5.0 parser (PIPE_STAGES 0/1/2)
+rtl/stat_counter.sv      statistics counter with registered segment carries
 rtl/stream_fifo.sv       fall-through valid/ready FIFO
 rtl/itch_book.sv         subscription table, order table, price-level book
 rtl/itch_top.sv          parser-only flat-port top
@@ -282,9 +456,11 @@ rtl/itch_feed_top.sv     parser -> FIFO -> book top
 tb/itch_model.py         ITCH/MoldUDP64 golden model and AXI-Stream packing
 tb/book_model.py         bit-exact book model, unbounded ideal book, market generator
 tb/test_itch.py          parser tests          tb/test_book.py   book tests
+tb/test_stat_counter.py  stat_counter unit test
 tb/run.py                cocotb runner (Verilator/Icarus, any parameters)
-scripts/                 setup, mutation testing, synthesis report
-syn/                     Yosys scripts
+scripts/                 setup, mutation testing, synthesis report, LUT-depth report
+                         (depth_report.py), openXC7 setup and place-and-route (pnr_xc7.sh)
+syn/                     Yosys scripts, timing_harness.sv (register-bounded wrapper for PnR)
 .github/workflows/ci.yml GitHub Actions
 ```
 
@@ -301,25 +477,31 @@ syn/                     Yosys scripts
 * **No sequence-gap handling.** MoldUDP64 session/sequence are parsed and reported, but not yet
   checked, so a lost packet silently corrupts the book. Gap detection and a snapshot/retransmit path
   come next.
-* **Timing not closed; resource numbers are Yosys estimates.** Vivado will differ. The order table
-  should be URAM, but Yosys inferred BRAM36.
-* **Parser input.** `tkeep` must be contiguous from lane 0 (partial beats anywhere are fine and
-  tested). Messages shorter than 7 bytes are treated as framing errors (the shortest ITCH message is
+* **Timing not closed in a vendor tool.** Fmax numbers are nextpnr-xilinx estimates on Artix-7
+  with a one-speed-grade timing model, and the resource numbers are Yosys estimates. Vivado will
+  differ, and no UltraScale+ timing exists yet. The order table should be URAM, but Yosys inferred
+  BRAM36.
+* **Stall-all flow control.** One advance enable drives every parser pipeline register, and
+  `m_ready` → `s_axis_tready` is combinational. Neither matters when the consumer always accepts (the
+  book does), but a skid buffer would be needed for a consumer with long ready paths.
+* **Parser input.** `tkeep` must be contiguous from lane 0. Partial beats anywhere, and empty `tlast`
+  beats, are fine and tested. The parser reads `tkeep` as a thermometer code, so a non-contiguous
+  `tkeep` is **not detected**: framing is wrong until the next `tlast` resynchronizes. Messages shorter than 7 bytes are treated as framing errors (the shortest ITCH message is
   12). A block may not span packets, as MoldUDP64 requires.
 * **Book scope.** `U` keeps the original side and slot, as the spec requires. Cross/auction (`Q`,
   `NOII`), trade (`P`), broken trade (`B`) and trading-state messages don't affect the book. Prices
   are raw Price(4) integers. Subscriptions must be written before traffic.
 * **Synthetic flow only.** The market generator is self-consistent, but it isn't a replay of real
   Nasdaq data (see next steps).
-* **CI.** The workflow passes `actionlint`, and its steps match the local reproduction path (fresh
-  clone, fresh venv, `make ci`). It hasn't run on GitHub's runners yet, because this repo has no
-  remote.
+* **CI** runs `make ci` on GitHub's `ubuntu-24.04` runners (badge above). Place-and-route is not in
+  CI; it needs the openXC7 download (~100 MB) and took about 70 s per configuration (3 seeds) here.
 
 ## Next steps
 
 1. **Timing closure** on a real part (Alveo U55C / VU9P): an OOC Vivado run with real Fmax and
-   utilization. Precompute next-beat `rem`/`cur_ends` in the parser, register the stats enables, and
-   pipeline the level update (compare stage → shift stage).
+   utilization for each `PIPE_STAGES`. Add an output skid buffer and an input register with a
+   precomputed `tkeep` decode in the parser. Pipeline the book's level update (compare stage → shift
+   stage) and put the book through place-and-route.
 2. **Set-associative order table in URAM**, prefetched by the early strobe (the order ref is known
    2–3 beats early).
 3. **MoldUDP64 session layer**: sequence tracking, gap detection, A/B feed arbitration, and
