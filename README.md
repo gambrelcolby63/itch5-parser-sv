@@ -1,6 +1,6 @@
 # itch-fpga: low-latency Nasdaq ITCH 5.0 feed handler in SystemVerilog
 
-<!-- After pushing to GitHub, add: ![ci](https://github.com/<user>/itch-fpga/actions/workflows/ci.yml/badge.svg) -->
+[![ci](https://github.com/gambrelcolby63/itch5-parser-sv/actions/workflows/ci.yml/badge.svg)](https://github.com/gambrelcolby63/itch5-parser-sv/actions/workflows/ci.yml)
 
 A synthesizable, vendor-neutral SystemVerilog **market-data feed handler** for Nasdaq TotalView-ITCH 5.0
 over MoldUDP64. It has two parts:
