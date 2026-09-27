@@ -7,7 +7,8 @@
 module itch_top
   import itch_pkg::*;
 #(
-  parameter bit MOLD_HDR = 1'b1
+  parameter bit          MOLD_HDR    = 1'b1,
+  parameter int unsigned PIPE_STAGES = 0
 ) (
   input  wire logic        clk,
   input  wire logic        rst,
@@ -57,7 +58,7 @@ module itch_top
   itch_msg_t msg;
   mold_hdr_t hdr;
 
-  itch_parser #(.MOLD_HDR(MOLD_HDR)) u_parser (
+  itch_parser #(.MOLD_HDR(MOLD_HDR), .PIPE_STAGES(PIPE_STAGES)) u_parser (
     .clk            (clk),
     .rst            (rst),
     .s_axis_tdata   (s_axis_tdata),

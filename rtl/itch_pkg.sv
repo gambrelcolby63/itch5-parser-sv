@@ -57,6 +57,37 @@ package itch_pkg;
     endcase
   endfunction
 
+  // Supported types as a one-hot index (0 for unsupported types), and a matching
+  // vector of "length equals that type's spec length" flags. The parser compares the
+  // block length against every spec length as soon as the length is known, so the
+  // final check is a one-hot AND instead of type decode -> length mux -> 16-bit compare.
+  //   bit: 0 S, 1 A, 2 F, 3 E, 4 C, 5 X, 6 D, 7 U
+  function automatic logic [7:0] type_onehot(input logic [7:0] t);
+    type_onehot = '0;
+    case (t)
+      MT_SYSTEM_EVENT:      type_onehot[0] = 1'b1;
+      MT_ADD_ORDER:         type_onehot[1] = 1'b1;
+      MT_ADD_ORDER_MPID:    type_onehot[2] = 1'b1;
+      MT_ORDER_EXECUTED:    type_onehot[3] = 1'b1;
+      MT_ORDER_EXECUTED_PX: type_onehot[4] = 1'b1;
+      MT_ORDER_CANCEL:      type_onehot[5] = 1'b1;
+      MT_ORDER_DELETE:      type_onehot[6] = 1'b1;
+      MT_ORDER_REPLACE:     type_onehot[7] = 1'b1;
+      default: ;
+    endcase
+  endfunction
+
+  function automatic logic [7:0] len_match(input logic [15:0] len);
+    len_match[0] = (len == LEN_SYSTEM_EVENT);
+    len_match[1] = (len == LEN_ADD_ORDER);
+    len_match[2] = (len == LEN_ADD_ORDER_MPID);
+    len_match[3] = (len == LEN_ORDER_EXECUTED);
+    len_match[4] = (len == LEN_ORDER_EXECUTED_PX);
+    len_match[5] = (len == LEN_ORDER_CANCEL);
+    len_match[6] = (len == LEN_ORDER_DELETE);
+    len_match[7] = (len == LEN_ORDER_REPLACE);
+  endfunction
+
   // True for message types that carry an Order Reference Number at offset 11.
   function automatic logic has_order_ref(input logic [7:0] t);
     case (t)

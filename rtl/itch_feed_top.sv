@@ -11,6 +11,7 @@ module itch_feed_top #(
   parameter int unsigned ORD_BITS    = 16,
   parameter int unsigned LOCATE_BITS = 14,
   parameter int unsigned MSG_FIFO_DEPTH = 2,   // peak backlog is 1 message (see README)
+  parameter int unsigned PARSER_PIPE = 0,     // itch_parser PIPE_STAGES (0..2)
   localparam int unsigned SLOT_BITS  = $clog2(NUM_SYMBOLS),
   localparam int unsigned CNT_BITS   = $clog2(LEVELS + 1)
 ) (
@@ -63,7 +64,7 @@ module itch_feed_top #(
   logic [63:0]         e_order_ref;
   itch_pkg::mold_hdr_t hdr;
 
-  itch_parser #(.MOLD_HDR(MOLD_HDR)) u_parser (
+  itch_parser #(.MOLD_HDR(MOLD_HDR), .PIPE_STAGES(PARSER_PIPE)) u_parser (
     .clk, .rst,
     .s_axis_tdata, .s_axis_tkeep, .s_axis_tvalid, .s_axis_tready, .s_axis_tlast,
     .m_msg (msg), .m_valid (msg_valid), .m_ready (msg_ready),
