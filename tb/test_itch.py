@@ -10,6 +10,11 @@ propagates to s_axis_tready), and monitors every output. Each cycle:
 Every decoded message, early strobe and MoldUDP64 header is compared against the
 golden model, and the latency from "beat carrying the last byte accepted" to
 "m_valid first seen" is measured for every message.
+
+Latency is checked exactly. The parser pipeline advances on every clock where
+s_axis_tready (= !m_valid | m_ready) is high, so for every message and early strobe:
+  * advancing clocks from acceptance to first visibility == 1 + PIPE_STAGES, and
+  * wall-clock latency == 1 + PIPE_STAGES whenever the output is never backpressured.
 """
 from __future__ import annotations
 
@@ -27,6 +32,8 @@ from itch_model import (OUT_FIELDS, SUPPORTED, UNSUPPORTED_ITCH, StreamBuilder, 
 MOLD = int(os.environ.get("ITCH_MOLD_HDR", "1"))
 SEED = int(os.environ.get("ITCH_SEED", "20260927"))
 N_RANDOM = int(os.environ.get("ITCH_N_MSGS", "20000"))
+PIPE = int(os.environ.get("ITCH_PIPE", "0"))
+LAT = 1 + PIPE
 
 SUMMARY: list[str] = []
 
@@ -73,6 +80,7 @@ class Harness:
         early_seen: list[int] = []
         in_beats = 0
         stall_cycles = 0  # cycles where tvalid=1 but tready=0
+        adv_prefix = [0]  # adv_prefix[c] = advancing clocks before cycle c
         drain = 0
         max_cycles = 10 * len(beats) + 1000
         c0 = {k: u(getattr(d, k)) for k in ("cnt_pkts", "cnt_msgs", "cnt_skipped", "cnt_err_len",
@@ -96,7 +104,9 @@ class Harness:
             d.m_ready.value = m_ready
 
             await ReadOnly()
-            in_fire = driving and u(d.s_axis_tready) == 1
+            adv = u(d.s_axis_tready)
+            adv_prefix.append(adv_prefix[-1] + adv)
+            in_fire = driving and adv == 1
             if driving and not in_fire:
                 stall_cycles += 1
             mv = u(d.m_valid)
@@ -124,7 +134,7 @@ class Harness:
             cycle += 1
             if bi == len(beats) and not driving and len(got) >= len(sb.expected):
                 drain += 1
-                if drain > 8:
+                if drain > 8 + PIPE:
                     break
             assert cycle < max_cycles, f"{name}: timeout (got {len(got)}/{len(sb.expected)} msgs)"
 
@@ -142,12 +152,22 @@ class Harness:
         if MOLD:
             assert got_hdr == sb.expected_hdrs, f"{name}: MoldUDP64 header mismatch ({len(got_hdr)} vs {len(sb.expected_hdrs)})"
 
+        def adv_between(a: int, b: int) -> int:     # advancing clocks in cycles [a, b)
+            return adv_prefix[b] - adv_prefix[a]
+
         lat = Counter(first_seen[i] - accept_cycle[i] for i in range(len(sb.expected)))
         elat = Counter(early_seen[i] - early_accept[i] for i in range(len(sb.expected_early)))
-        # With a free output register the latency must be exactly 1 cycle; if the output
-        # register was still occupied, the input was stalled so the beat was not accepted.
-        assert set(lat) <= {1}, f"{name}: unexpected msg latency histogram {dict(lat)}"
-        assert set(elat) <= {1}, f"{name}: unexpected early latency histogram {dict(elat)}"
+        plat = Counter(adv_between(accept_cycle[i], first_seen[i]) for i in range(len(sb.expected)))
+        pelat = Counter(adv_between(early_accept[i], early_seen[i]) for i in range(len(sb.expected_early)))
+        # Pipeline latency (advancing clocks) is exact in every case; wall-clock latency is
+        # exact when nothing stalls and can only grow under output backpressure.
+        assert set(plat) <= {LAT}, f"{name}: msg pipeline latency {dict(plat)}, expected {LAT}"
+        assert set(pelat) <= {LAT}, f"{name}: early pipeline latency {dict(pelat)}, expected {LAT}"
+        assert min(lat, default=LAT) >= LAT and min(elat, default=LAT) >= LAT, \
+            f"{name}: latency below {LAT}: {dict(lat)} {dict(elat)}"
+        if PIPE == 0 or expect_no_stall:
+            assert set(lat) <= {LAT}, f"{name}: msg latency {dict(lat)}, expected {LAT}"
+            assert set(elat) <= {LAT}, f"{name}: early latency {dict(elat)}, expected {LAT}"
 
         if expect_no_stall:
             assert stall_cycles == 0, f"{name}: {stall_cycles} input stall cycles at full rate"
@@ -165,7 +185,8 @@ class Harness:
         line = (f"{name}: PASS  frames={sb.n_frames} blocks={sb.n_blocks} decoded={len(got)} "
                 f"skipped={c1['cnt_skipped']} early={len(got_early)} hdrs={len(got_hdr)} "
                 f"beats={in_beats} stalls={stall_cycles} cycles={cycle} bytes={sb.n_bytes} "
-                f"latency_cycles={dict(lat)} early_latency={dict(elat)} types={dict(sorted(types.items()))}")
+                f"latency_cycles={dict(sorted(lat.items()))} pipe_latency={dict(plat)} "
+                f"early_latency={dict(sorted(elat.items()))} types={dict(sorted(types.items()))}")
         d._log.info(line)
         SUMMARY.append(line)
         return c1
@@ -281,8 +302,21 @@ async def test_errors_and_recovery(dut):
             # 4) header message count disagrees with the blocks present -> err_count
             sb.add_frame(good(2), count=5)
             exp["cnt_err_count"] += 1
-            # end-of-session packet (count 0xFFFF, no blocks) is legal
+            # end-of-session packet (count 0xFFFF, no blocks) is legal, with or without an
+            # empty (tkeep = 0) tlast beat after the header; so is a heartbeat (count 0)
             sb.add_frame([], count=0xFFFF)
+            sb.add_frame([], count=0xFFFF, null_last=True)
+            sb.add_frame([], count=0, null_last=True)
+            # 0xFFFF / 0 announce no blocks: blocks after them are a count error, whether the
+            # last block ends in the tlast beat or an empty tlast beat follows it
+            sb.add_frame(good(2), count=0xFFFF)
+            sb.add_frame(good(1), count=0xFFFF, null_last=True)
+            sb.add_frame(good(1), count=0, null_last=True)
+            exp["cnt_err_count"] += 3
+            # correct count followed by an empty tlast beat is fine; one short is not
+            sb.add_frame(good(2), null_last=True)
+            sb.add_frame(good(2), count=3, null_last=True)
+            exp["cnt_err_count"] += 1
         sb.add_frame(good(3))
     await h.run(sb, rng, p_valid=0.8, p_ready=0.8, name="errors_and_recovery", check_counters=exp)
 
@@ -293,4 +327,4 @@ async def test_summary(dut):
     for line in SUMMARY:
         dut._log.info("SUMMARY %s", line)
     total = sum(int(l.split("decoded=")[1].split()[0]) for l in SUMMARY)
-    dut._log.info("SUMMARY TOTAL decoded messages checked (MOLD_HDR=%d): %d", MOLD, total)
+    dut._log.info("SUMMARY TOTAL decoded messages checked (MOLD_HDR=%d, PIPE_STAGES=%d): %d", MOLD, PIPE, total)

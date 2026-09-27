@@ -152,11 +152,12 @@ class Beat:
 
 
 def pack_frame(frame: bytes, byte_tags: dict[int, tuple[str, int]] | None = None,
-               sparse_rng: random.Random | None = None) -> list[Beat]:
+               sparse_rng: random.Random | None = None, null_last: bool = False) -> list[Beat]:
     """Pack one tlast-delimited frame into beats. byte_tags maps a byte index in the frame
     to ("end"|"early", expected_msg_index). Normally beats are full (8 bytes) except the
     last; with sparse_rng, beats carry a random 1..8 bytes (tkeep contiguous from lane 0)
-    and the unused upper lanes are filled with junk."""
+    and the unused upper lanes are filled with junk. With null_last, the frame ends with an
+    extra beat that carries no bytes (tkeep = 0, tlast = 1), which AXI4-Stream allows."""
     beats = []
     i = 0
     while i < len(frame):
@@ -173,6 +174,10 @@ def pack_frame(frame: bytes, byte_tags: dict[int, tuple[str, int]] | None = None
                         (b.ends if kind == "end" else b.early).append(idx)
         beats.append(b)
         i += n
+    if null_last:
+        if beats:
+            beats[-1].last = 0
+        beats.append(Beat(data=(sparse_rng or random.Random(len(frame))).getrandbits(64), keep=0, last=1))
     return beats
 
 
@@ -195,8 +200,9 @@ class StreamBuilder:
         self.n_bytes = 0
 
     def add_frame(self, msgs: list[bytes], count: int | None = None, raw_tail: bytes = b"",
-                  expect: bool = True):
-        """Add one frame. With mold=True a MoldUDP64 header is prepended."""
+                  expect: bool = True, null_last: bool | None = None):
+        """Add one frame. With mold=True a MoldUDP64 header is prepended. null_last ends the
+        frame with an empty (tkeep = 0) tlast beat; by default 10% of sparse frames do."""
         if self.mold:
             prefix = self.session + struct.pack(">QH", self.seq, len(msgs) if count is None else count)
             if expect:
@@ -237,7 +243,9 @@ class StreamBuilder:
                                             int.from_bytes(m[11:19], "big")))
                 tags.setdefault(pos + 2 + 18, []).append(("early", eidx))
         frame = prefix + bytes(body) + raw_tail
-        self.beats += pack_frame(frame, tags, self.sparse_rng)
+        if null_last is None:
+            null_last = self.sparse_rng is not None and self.sparse_rng.random() < 0.1
+        self.beats += pack_frame(frame, tags, self.sparse_rng, null_last)
         self.n_frames += 1
         self.n_bytes += len(frame)
         return frame

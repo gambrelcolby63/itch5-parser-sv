@@ -25,6 +25,9 @@ LEVELS = int(os.environ.get("ITCH_LEVELS", "8"))
 ORD_BITS = int(os.environ.get("ITCH_ORD_BITS", "12"))
 NUM_SYMBOLS = int(os.environ.get("ITCH_NUM_SYMBOLS", "256"))
 LOCATE_BITS = int(os.environ.get("ITCH_LOCATE_BITS", "14"))
+PIPE = int(os.environ.get("ITCH_PIPE", "0"))          # itch_feed_top PARSER_PIPE
+# tlast-beat accept -> bk_valid: parser (1 + PARSER_PIPE) + message FIFO + book (3)
+BOOK_LAT = 4 + PIPE
 
 SUMMARY: list[str] = []
 STAT_MAP = {"cnt_bk_events": "events", "cnt_unsub": "unsub", "cnt_ord_collide": "collide",
@@ -141,7 +144,7 @@ async def run_stream(dut, sb: StreamBuilder, model: BookModel, rng: random.Rando
         cycle += 1
         if bi == len(beats) and not driving:
             drain += 1
-            if drain > 16:
+            if drain > 16 + PIPE:
                 break
         assert cycle < max_cycles, f"{name}: timeout"
 
@@ -162,7 +165,9 @@ async def run_stream(dut, sb: StreamBuilder, model: BookModel, rng: random.Rando
         d_mod = model.stats[mk] - mstats0[mk]
         assert d_dut == d_mod, f"{name}: {k} dut={d_dut} model={d_mod}"
     lat = Counter(got_cycle[i] - accept_cycle[exp_src[i]] for i in range(len(got)))
-    assert min(lat) >= 4 if lat else True
+    # The parser -> book path has a fixed latency: every event, exactly BOOK_LAT cycles.
+    assert not lat or set(lat) == {BOOK_LAT}, \
+        f"{name}: latency {dict(sorted(lat.items()))}, expected exactly {BOOK_LAT} (PARSER_PIPE={PIPE})"
     st = {mk: model.stats[mk] - mstats0[mk] for mk in STAT_MAP.values()}
     line = (f"{name}: PASS msgs={len(sb.expected)} book_events={len(got)} beats={len(beats)} "
             f"cycles={cycle} input_stalls={stalls} fifo_max={fifo_max if fifo_level is not None else 'n/a'} latency_hist={dict(sorted(lat.items()))} stats={st}")
