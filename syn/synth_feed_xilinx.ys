@@ -1,0 +1,6 @@
+# Parser + FIFO + order book, default parameters (256 symbols, 8 levels, 64K-entry
+# order table, 16K-entry subscription table), mapped to Xilinx UltraScale+.
+# (run `make synth`; it generates syn/out/itch_feed_top_sv2v.v first)
+read_verilog syn/out/itch_feed_top_sv2v.v
+synth_xilinx -top itch_feed_top -family xcup -flatten -noiopad
+tee -o syn/out/stat_feed_xilinx.txt stat

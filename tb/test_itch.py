@@ -74,7 +74,7 @@ class Harness:
         in_beats = 0
         stall_cycles = 0  # cycles where tvalid=1 but tready=0
         drain = 0
-        max_cycles = 50 * len(beats) + 1000
+        max_cycles = 10 * len(beats) + 1000
         c0 = {k: u(getattr(d, k)) for k in ("cnt_pkts", "cnt_msgs", "cnt_skipped", "cnt_err_len",
                                              "cnt_err_short", "cnt_err_trunc", "cnt_err_count")}
         while True:

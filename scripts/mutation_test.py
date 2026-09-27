@@ -10,7 +10,7 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 PY = sys.executable
 
-# (description, file, exact original text, mutated text)
+# (description, file, exact original text, mutated text); target = parser or feed (book)
 MUTATIONS = [
     ("Cancel shares read from offset 20 instead of 19", "itch_parser.sv",
      "      MT_ORDER_CANCEL: begin\n        dec.order_ref     = `ITCH_FLD(11, 8);\n        dec.shares        = `ITCH_FLD(19, 4);",
@@ -35,10 +35,38 @@ MUTATIONS = [
      "MOLD_HDR_BYTES = 20;", "MOLD_HDR_BYTES = 18;"),
 ]
 
+BOOK_MUTATIONS = [
+    ("Book: asks sorted like bids", "itch_book.sv",
+     "return side ? (a < b) : (a > b);", "return side ? (a > b) : (a > b);"),
+    ("Book: fully executed order not deleted", "itch_book.sv",
+     "ordA_wd        = '0;                       // fully executed: delete",
+     "ordA_wd.shares = '0;"),
+    ("Book: replace into its own bucket seen as collision", "itch_book.sv",
+     "freeB      = !ordB_valid || (is_rep && hitA && (idxA_q == idxB_q));",
+     "freeB      = !ordB_valid;"),
+    ("Book: vacated last level not cleared", "itch_book.sv",
+     "b1.lv[LEVELS-1] = '0;", "b1.lv[LEVELS-1] = lvl_rd.lv[LEVELS-1];"),
+    ("Book: trunc flag not set when worst level falls off", "itch_book.sv",
+     "          add_drop = 1'b1;                             // worst level fell off\n          b2.trunc = 1'b1;",
+     "          add_drop = 1'b1;                             // worst level fell off"),
+    ("Book: exec/cancel uses message price, not resting price", "itch_book.sv",
+     "      end else if (is_exec) begin\n        look_go = 1'b1;",
+     "      end else if (is_exec) begin\n        sub_px  = msg_q.price;\n        look_go = 1'b1;"),
+    ("Book: Add side decoded as always bid", "itch_book.sv",
+     "lvl_addr = {sub_rd.slot, (msg_q.side == 8'h53)};", "lvl_addr = {sub_rd.slot, 1'b0};"),
+    ("Book: locate beyond table aliases into it", "itch_book.sv",
+     "subscribed = sub_rd.enable && !loc_hi_q;", "subscribed = sub_rd.enable;"),
+    ("Book: level qty overwritten instead of accumulated", "itch_book.sv",
+     "b2.lv[fi].qty = b1.lv[fi].qty + add_q_q;", "b2.lv[fi].qty = add_q_q;"),
+    ("FIFO: bypass ignores consumer ready", "stream_fifo.sv",
+     "assign bypass    = empty && in_valid && out_ready;", "assign bypass    = empty && in_valid;"),
+]
+
 
 def main() -> int:
     caught = 0
-    for i, (desc, fname, old, new) in enumerate(MUTATIONS):
+    jobs = [(m, "parser") for m in MUTATIONS] + [(m, "feed") for m in BOOK_MUTATIONS]
+    for i, ((desc, fname, old, new), target) in enumerate(jobs):
         mdir = ROOT / "build" / "mutants" / f"m{i}"
         if mdir.exists():
             shutil.rmtree(mdir)
@@ -47,7 +75,8 @@ def main() -> int:
         src = f.read_text()
         assert src.count(old) == 1, f"mutation {i} pattern not found uniquely: {desc}"
         f.write_text(src.replace(old, new))
-        r = subprocess.run([PY, str(ROOT / "tb" / "run.py"), "--mold", "1", "--msgs", "2000",
+        r = subprocess.run([PY, str(ROOT / "tb" / "run.py"), "--top", target, "--mold", "1",
+                            "--msgs", "2000", "--book-msgs", "3000",
                             "--rtl-dir", str(mdir / "rtl"), "--build-dir", str(mdir / "sim")],
                            capture_output=True, text=True)
         out = r.stdout + r.stderr
@@ -56,9 +85,9 @@ def main() -> int:
         caught += killed
         status = "KILLED" if killed else "SURVIVED"
         detail = m.group(0) if m else "build/run error"
-        print(f"[{status:8}] {desc:55} ({detail})", flush=True)
-    print(f"MUTATION SCORE: {caught}/{len(MUTATIONS)} mutants killed")
-    return 0 if caught == len(MUTATIONS) else 1
+        print(f"[{status:8}] {desc:58} ({detail})", flush=True)
+    print(f"MUTATION SCORE: {caught}/{len(jobs)} mutants killed")
+    return 0 if caught == len(jobs) else 1
 
 
 if __name__ == "__main__":
