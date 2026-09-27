@@ -48,7 +48,7 @@ flowchart LR
     subgraph B["itch_book (3 clk)"]
         direction TB
         SUB[("subscription table<br/>locate → slot<br/>16K × 9b")]
-        ORD[("order table<br/>ref → slot/side/px/qty<br/>64K × 137b, TDP")]
+        ORD[("order table<br/>ref → slot/side/px/qty<br/>64K × 138b, TDP")]
         LVL[("level table<br/>(slot,side) → 8 levels<br/>512 × 517b")]
         UPD["parallel level update<br/>match / insert / shift / remove"]
         SUB --> ORD --> LVL --> UPD --> LVL
@@ -114,7 +114,7 @@ one clock period. The ns columns only convert units: **no Fmax is claimed** (see
 |---|---|---|
 | `LEVELS` | **8** | Covers what near-touch HFT signals typically use (top-of-book, imbalance, microprice, depth near the touch). A side-book word is 8 × (32b px + 32b qty) + count + flag = 517 bits, so it fits one 576-bit row of 8 parallel 72-bit BRAM36s. The insert/shift network grows linearly with depth. Measured in the synthetic test market: 4 levels → 71.4% full-depth agreement with an unbounded book; 8 → 99.2%; 16 → 100%, at 2× the word width and update logic. |
 | `NUM_SYMBOLS` | **256** | A realistic strategy universe (e.g. an ETF plus its constituents). 256 × 2 sides = 512 rows, exactly the depth of a BRAM36 in 72-bit mode, so no BRAM is wasted. |
-| `ORD_BITS` | **16** (64K orders) | Holds only *subscribed* symbols' live orders. An entry is 137 bits. Yosys maps it to BRAM36; a production build would target URAM (see limits). Tests use 12 (4K entries) to force collisions. |
+| `ORD_BITS` | **16** (64K orders) | Holds only *subscribed* symbols' live orders. An entry is 138 bits (valid, 64b ref, slot, side, price, shares). Yosys maps it to BRAM36; a production build would target URAM (see limits). Tests use 12 (4K entries) to force collisions. |
 | `LOCATE_BITS` | **14** (16K) | Stock Locate is a 16-bit field, but codes are assigned per day for the securities in the Stock Directory, on the order of 10⁴ symbols. 16K × 9 b costs about 4 BRAM36. Out-of-range locates are **rejected, never aliased**; a directed test and a mutant cover this. |
 | `MSG_FIFO_DEPTH` | **2** | Peak backlog is 1 message (a small message arriving during a 2-cycle book update). Depth 2 lets a push and a pop happen in the same cycle without stalling. Measured peak occupancy is 1 in every test. |
 
@@ -193,8 +193,9 @@ book/FIFO. Examples: wrong field offsets, off-by-one lane steering, a split-leng
 treated as a collision, a stale last level, a missing `trunc`, `C` using the execution price, a
 locate that aliases into the table, and a FIFO bypass that ignores ready. **All 20 are caught.**
 
-The same regressions pass on **Icarus Verilog 12** (`make test-icarus`), which gives a two-simulator
-cross-check.
+The same regressions pass on **Icarus Verilog 12** (`make test-icarus`, at reduced size for speed):
+parser 6/6 with 6,614 messages, and book 5/5 with the same latency (`{1: all}` and `{4: all}`). That
+gives a two-simulator cross-check.
 
 ## Static analysis
 
@@ -208,7 +209,30 @@ MSG_FIFO_DEPTH=4`. The result is **0 warnings**, and there are no `lint_off` pra
 the module header) and maps it with Yosys 0.52 `synth_xilinx -family xcup` (UltraScale+), without
 IO buffers.
 
-SYNTH_TABLE_PLACEHOLDER
+| Design (Yosys 0.52 `synth_xilinx -family xcup`) | LUT | FF | RAMB36 | RAMB18 | LUTRAM | MUXF7/8/9 | CARRY |
+|---|---|---|---|---|---|---|---|
+| `itch_top` (parser only) | 5,143 | 1,326 | 0 | 0 | 0 | 1073/393/104 | 101 |
+| `itch_feed_top` (parser + FIFO + book, defaults) | 10,328 | 2,109 | 260 | 15 | 23 | 2150/787/226 | 243 |
+
+Generic `abc -lut 6` map of the parser alone: 2,622 LUT6, longest path 22 LUT levels.
+
+**Where the book's logic goes** (feed top, other parameters at their defaults; book + FIFO = feed − parser):
+
+| Variant | Feed LUT | Book + FIFO LUT | FF | RAMB36 / RAMB18 |
+|---|---|---|---|---|
+| `LEVELS=4` | 7,856 | ~2.7k | 1,852 | 264 / 0 |
+| `LEVELS=8` (default) | 10,328 | ~5.2k | 2,109 | 260 / 15 |
+| `LEVELS=16` | 15,121 | ~10.0k | 2,622 | 260 / 29 |
+| `ORD_BITS=12` (4K orders) | 10,156 | ~5.0k | 2,095 | 20 / 15 |
+
+* Book logic grows **linearly with depth, about 600 LUTs per level**. That is the parallel
+  compare/insert/shift network, which is what `LEVELS` really costs.
+* Shrinking the order table 16× saves 240 RAMB36 but almost no LUTs, so the order-table datapath
+  is not the logic cost. Its 64K × 138b (about 9 Mb) belongs in URAM on UltraScale+.
+* An RTL-style lesson: the first version indexed packed-struct members with loop variables
+  (`book.lv[i].price`). That was 16,352 LUTs for the same function, and Icarus couldn't compile it.
+  Rewriting the level network on plain unpacked `px[]`/`qty[]` arrays gave bit-identical
+  simulation results (every regression, and all 20 mutants re-killed) at 37% fewer LUTs.
 
 **Timing (honest).** No Fmax is claimed; nothing has been through Vivado or timing closure yet.
 
@@ -218,6 +242,7 @@ SYNTH_TABLE_PLACEHOLDER
 * In the book, the cones are the order-table read → level-table address path (block RAM
   clock-to-out feeding an address), and the 8-level compare/insert network on a 517-bit word.
 * Timing closure on a real part is the first next step.
+* Verification is at RTL level. The Yosys netlist has not been simulated or equivalence-checked.
 
 ## Reproduce
 

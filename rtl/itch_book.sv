@@ -106,16 +106,15 @@ module itch_book
     logic [SLOT_BITS-1:0] slot;
   } sub_t;
 
-  typedef struct packed {
-    logic [31:0] price;
-    logic [31:0] qty;
-  } level_t;
-
+  // One (slot, side) row of the level table. Level i occupies lv[64*i +: 64] as
+  // {price[31:0], qty[31:0]}; level 0 is the best. Unused levels are all-zero.
   typedef struct packed {
     logic                      trunc;
     logic [CNT_BITS-1:0]       count;
-    level_t [LEVELS-1:0]       lv;      // lv[0] = best
+    logic [LEVELS*64-1:0]      lv;
   } side_book_t;
+
+  localparam int unsigned IDX_BITS = (LEVELS > 1) ? $clog2(LEVELS) : 1;
 
   localparam int unsigned ORD_DEPTH = 2 ** ORD_BITS;
   localparam int unsigned SUB_DEPTH = 2 ** LOCATE_BITS;
@@ -172,7 +171,9 @@ module itch_book
   sub_t                sub_rd;
   logic                loc_hi_q;       // locate outside the subscription table
   order_t              ordA_rd;
-  logic                ordB_valid;         // port B only needs occupancy
+  order_t              ordB_rd;            // port B only needs occupancy (.valid);
+  logic                ordB_valid;         // synthesis trims the other read bits
+  assign ordB_valid = ordB_rd.valid;
   logic [ORD_BITS-1:0] idxA_q, idxB_q;
   logic [ORD_BITS-1:0] idxA_in, idxB_in;
   logic [LOCATE_BITS-1:0] loc_in;
@@ -188,10 +189,14 @@ module itch_book
 
   always_ff @(posedge clk) begin
     if (accept) begin
-      msg_q    <= '{msg_type: in_msg.msg_type, stock_locate: in_msg.stock_locate,
-                    timestamp: in_msg.timestamp, order_ref: in_msg.order_ref,
-                    new_order_ref: in_msg.new_order_ref, side: in_msg.side,
-                    shares: in_msg.shares, price: in_msg.price};
+      msg_q.msg_type      <= in_msg.msg_type;
+      msg_q.stock_locate  <= in_msg.stock_locate;
+      msg_q.timestamp     <= in_msg.timestamp;
+      msg_q.order_ref     <= in_msg.order_ref;
+      msg_q.new_order_ref <= in_msg.new_order_ref;
+      msg_q.side          <= in_msg.side;
+      msg_q.shares        <= in_msg.shares;
+      msg_q.price         <= in_msg.price;
       idxA_q   <= idxA_in;
       idxB_q   <= idxB_in;
       loc_hi_q <= loc_hi_in;
@@ -236,9 +241,13 @@ module itch_book
       end else if (is_add) begin
         lvl_addr = {sub_rd.slot, (msg_q.side == 8'h53)};   // 'S' = sell = ask
         if (freeB) begin
-          ordB_we = 1'b1;
-          ordB_wd = '{valid: 1'b1, order_ref: msg_q.order_ref, slot: sub_rd.slot,
-                      side: (msg_q.side == 8'h53), price: msg_q.price, shares: msg_q.shares};
+          ordB_we           = 1'b1;
+          ordB_wd.valid     = 1'b1;
+          ordB_wd.order_ref = msg_q.order_ref;
+          ordB_wd.slot      = sub_rd.slot;
+          ordB_wd.side      = (msg_q.side == 8'h53);
+          ordB_wd.price     = msg_q.price;
+          ordB_wd.shares    = msg_q.shares;
           op_add  = 1'b1;
           look_go = 1'b1;
         end else begin
@@ -271,9 +280,13 @@ module itch_book
         ordA_we = !(freeB && (idxA_q == idxB_q));
         ordA_wd = '0;
         if (freeB) begin
-          ordB_we = 1'b1;
-          ordB_wd = '{valid: 1'b1, order_ref: msg_q.new_order_ref, slot: ordA_rd.slot,
-                      side: ordA_rd.side, price: msg_q.price, shares: msg_q.shares};
+          ordB_we           = 1'b1;
+          ordB_wd.valid     = 1'b1;
+          ordB_wd.order_ref = msg_q.new_order_ref;
+          ordB_wd.slot      = ordA_rd.slot;
+          ordB_wd.side      = ordA_rd.side;
+          ordB_wd.price     = msg_q.price;
+          ordB_wd.shares    = msg_q.shares;
           op_add  = 1'b1;
         end else begin
           look_collide = 1'b1;
@@ -310,77 +323,124 @@ module itch_book
     return side ? (a < b) : (a > b);
   endfunction
 
-  side_book_t b1, b2;
-  logic       sub_miss, add_drop;
+  // The side book is handled as plain unpacked price/qty arrays: unpacked from the
+  // RAM word here and repacked below.
+  //   step 0 = as read, step 1 = after removing quantity, step 2 = after adding quantity
+  logic [31:0]         px0 [0:LEVELS-1], qt0 [0:LEVELS-1];
+  logic [31:0]         px1 [0:LEVELS-1], qt1 [0:LEVELS-1];
+  logic [31:0]         px2 [0:LEVELS-1], qt2 [0:LEVELS-1];
+  logic [CNT_BITS-1:0] cnt0, cnt1, cnt2;
+  logic                trunc2;
+  logic [LEVELS*64-1:0] lv_in, lv_out;
+  side_book_t          b2;
+  logic                sub_miss, add_drop;
 
+  always_comb begin : level_unpack
+    lv_in = lvl_rd.lv;
+    cnt0  = lvl_rd.count;
+    for (int i = 0; i < LEVELS; i++) begin
+      px0[i] = lv_in[64*i + 32 +: 32];    // level_t = {price, qty}
+      qt0[i] = lv_in[64*i      +: 32];
+    end
+  end
+
+  // Step 1: remove quantity at sub_px_q (E/C/X/D, and the old price of U).
   always_comb begin : level_sub
-    logic                      found;
-    logic [CNT_BITS-1:0]       fi;
-    b1       = lvl_rd;
+    logic                found;
+    logic [IDX_BITS-1:0] fi;
+    for (int i = 0; i < LEVELS; i++) begin
+      px1[i] = px0[i];
+      qt1[i] = qt0[i];
+    end
+    cnt1     = cnt0;
     sub_miss = 1'b0;
     found    = 1'b0;
     fi       = '0;
     for (int i = 0; i < LEVELS; i++) begin
-      if (!found && (CNT_BITS'(i) < lvl_rd.count) && (lvl_rd.lv[i].price == sub_px_q)) begin
+      if (!found && (CNT_BITS'(i) < cnt0) && (px0[i] == sub_px_q)) begin
         found = 1'b1;
-        fi    = CNT_BITS'(i);
+        fi    = IDX_BITS'(i);
       end
     end
     if (op_sub_q) begin
       if (!found) begin
         sub_miss = 1'b1;
-      end else if (lvl_rd.lv[fi].qty > sub_q_q) begin
-        b1.lv[fi].qty = lvl_rd.lv[fi].qty - sub_q_q;
+      end else if (qt0[fi] > sub_q_q) begin
+        qt1[fi] = qt0[fi] - sub_q_q;
       end else begin
-        // Level empties: shift the worse levels up by one.
+        // Level empties: shift the worse levels up by one, clear the last slot.
         for (int i = 0; i < LEVELS - 1; i++) begin
-          if (CNT_BITS'(i) >= fi) b1.lv[i] = lvl_rd.lv[i + 1];
+          if (IDX_BITS'(i) >= fi) begin
+            px1[i] = px0[i + 1];
+            qt1[i] = qt0[i + 1];
+          end
         end
-        b1.lv[LEVELS-1] = '0;
-        b1.count        = lvl_rd.count - CNT_BITS'(1);
+        px1[LEVELS-1] = '0;
+        qt1[LEVELS-1] = '0;
+        cnt1          = cnt0 - CNT_BITS'(1);
       end
     end
   end
 
+  // Step 2: add quantity at add_px_q (A/F, and the new price of U).
   always_comb begin : level_add
     logic                found;
-    logic [CNT_BITS-1:0] fi;
+    logic [IDX_BITS-1:0] fi;
     logic [CNT_BITS-1:0] k;    // insertion index = number of strictly better levels
-    b2       = b1;
+    for (int i = 0; i < LEVELS; i++) begin
+      px2[i] = px1[i];
+      qt2[i] = qt1[i];
+    end
+    cnt2     = cnt1;
+    trunc2   = lvl_rd.trunc;
     add_drop = 1'b0;
     found    = 1'b0;
     fi       = '0;
     k        = '0;
     for (int i = 0; i < LEVELS; i++) begin
-      if (CNT_BITS'(i) < b1.count) begin
-        if (!found && (b1.lv[i].price == add_px_q)) begin
+      if (CNT_BITS'(i) < cnt1) begin
+        if (!found && (px1[i] == add_px_q)) begin
           found = 1'b1;
-          fi    = CNT_BITS'(i);
+          fi    = IDX_BITS'(i);
         end
-        if (better(lvl_side_q, b1.lv[i].price, add_px_q)) k = k + CNT_BITS'(1);
+        if (better(lvl_side_q, px1[i], add_px_q)) k = k + CNT_BITS'(1);
       end
     end
     if (op_add_q) begin
       if (found) begin
-        b2.lv[fi].qty = b1.lv[fi].qty + add_q_q;
+        qt2[fi] = qt1[fi] + add_q_q;
       end else if (k == CNT_BITS'(LEVELS)) begin
         add_drop = 1'b1;                               // worse than a full book
-        b2.trunc = 1'b1;
+        trunc2   = 1'b1;
       end else begin
         for (int i = 1; i < LEVELS; i++) begin
-          if (CNT_BITS'(i) > k) b2.lv[i] = b1.lv[i - 1];
+          if (CNT_BITS'(i) > k) begin
+            px2[i] = px1[i - 1];
+            qt2[i] = qt1[i - 1];
+          end
         end
         for (int i = 0; i < LEVELS; i++) begin
-          if (CNT_BITS'(i) == k) b2.lv[i] = '{price: add_px_q, qty: add_q_q};
+          if (CNT_BITS'(i) == k) begin
+            px2[i] = add_px_q;
+            qt2[i] = add_q_q;
+          end
         end
-        if (b1.count == CNT_BITS'(LEVELS)) begin
+        if (cnt1 == CNT_BITS'(LEVELS)) begin
           add_drop = 1'b1;                             // worst level fell off
-          b2.trunc = 1'b1;
+          trunc2   = 1'b1;
         end else begin
-          b2.count = b1.count + CNT_BITS'(1);
+          cnt2 = cnt1 + CNT_BITS'(1);
         end
       end
     end
+  end
+
+  always_comb begin : level_pack
+    for (int i = 0; i < LEVELS; i++) begin
+      lv_out[64*i + 32 +: 32] = px2[i];
+      lv_out[64*i      +: 32] = qt2[i];
+    end
+    b2 = {trunc2, cnt2, lv_out};
   end
 
   // ---------------------------------------------------------------------------
@@ -431,7 +491,11 @@ module itch_book
     sub_we    = init ? (clr_idx_q < CLR_BITS'(SUB_DEPTH))
                      : (cfg_we && ((32'(cfg_locate) >> LOCATE_BITS) == 32'd0));
     sub_waddr = init ? clr_idx_q[LOCATE_BITS-1:0] : cfg_locate[LOCATE_BITS-1:0];
-    sub_wd    = init ? '0 : '{enable: cfg_enable, slot: cfg_slot};
+    sub_wd        = '0;
+    if (!init) begin
+      sub_wd.enable = cfg_enable;
+      sub_wd.slot   = cfg_slot;
+    end
     // Order table (true dual port)
     ordA_addr = init ? clr_idx_q[ORD_BITS-1:0] : ((state_q == S_LOOK) ? idxA_q : idxA_in);
     ordA_wen  = init ? (clr_idx_q < CLR_BITS'(ORD_DEPTH)) : ordA_we;
@@ -456,7 +520,7 @@ module itch_book
 
   always_ff @(posedge clk) begin
     if (ordB_wen) ord_mem[ordB_addr] <= ordB_wd;
-    if (accept)   ordB_valid <= ord_mem[ordB_addr].valid;
+    if (accept)   ordB_rd <= ord_mem[ordB_addr];
   end
 
   always_ff @(posedge clk) begin
@@ -474,14 +538,14 @@ module itch_book
     if (state_q == S_UPD) begin
       bk_slot      <= lvl_addr_q[LVL_BITS-1:1];
       bk_side      <= lvl_side_q;
-      bk_count     <= b2.count;
-      bk_trunc     <= b2.trunc;
+      bk_count     <= cnt2;
+      bk_trunc     <= trunc2;
       bk_msg_type  <= msg_q.msg_type;
       bk_locate    <= msg_q.stock_locate;
       bk_timestamp <= msg_q.timestamp;
       for (int i = 0; i < LEVELS; i++) begin
-        bk_price[32*i +: 32] <= b2.lv[i].price;
-        bk_qty[32*i +: 32]   <= b2.lv[i].qty;
+        bk_price[32*i +: 32] <= px2[i];
+        bk_qty[32*i +: 32]   <= qt2[i];
       end
     end
   end
@@ -510,7 +574,9 @@ module itch_book
   // Fields of the decoded message the book does not use.
   logic unused_ok;
   assign unused_ok = ^{1'b0, in_msg.tracking_num, in_msg.stock, in_msg.attribution,
-                       in_msg.match_number, in_msg.printable, in_msg.event_code, 1'b0};
+                       in_msg.match_number, in_msg.printable, in_msg.event_code,
+                       ordB_rd.order_ref, ordB_rd.slot, ordB_rd.side, ordB_rd.price,
+                       ordB_rd.shares, 1'b0};
 
 endmodule
 
