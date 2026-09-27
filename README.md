@@ -22,7 +22,7 @@ Everything is verified with cocotb against independent Python golden models, on 
 | Parser latency | **1 clock**, last byte in → decoded message registered (measured for every message) |
 | Book latency | **4 clocks**, last byte in → post-update side book registered (measured for every event) |
 | Throughput | 8 B/clock sustained, **0 input stall cycles** in every full-rate test, including a worst-case message-rate stream |
-| Verification | parser: 42k messages per `make test` plus an 849k-message soak; book: 4 tests with exact per-event comparison; mutation testing (20 injected bugs, all caught) |
+| Verification | parser: 42k messages per `make test`; book: every event compared bit-exactly with a model; soak of 849k parser messages + 1.73M parser→book messages over 5 seeds; mutation testing (20 injected bugs, all caught); Verilator + Icarus |
 | Reproducible | `make lint`, `make test`, `make synth`; GitHub Actions workflow for lint + tests |
 
 ## Architecture
@@ -169,6 +169,15 @@ parser MOLD_HDR=1   TESTS=6 PASS=6 FAIL=0   21,125 messages   latency {1: 21125}
 parser MOLD_HDR=0   TESTS=6 PASS=6 FAIL=0   20,990 messages   latency {1: 20990}
 parser+book         TESTS=5 PASS=5 FAIL=0   book_random: 28,494 msgs -> 18,207 book events, latency {4: 18207}
                                             book_adversarial_rate: 47,387 beats, input_stalls=0
+```
+
+**Soak** (`make soak`, seeds 1–5, about 10 minutes):
+
+```
+parser  10 runs (5 seeds x Mold/raw)   30/30 tests pass   848,951 messages      latency always 1
+book     5 runs (5 seeds, 200k each)    25/25 tests pass   1,731,264 messages through parser->book
+         book_random: 949,734 msgs -> 604,944 events, all bit-exact vs BookModel,
+         latency {4: all}, 0 input stalls, peak FIFO occupancy 1
 ```
 
 **How close is the bounded hardware book to the true book?** This is measured on the `book_random`
